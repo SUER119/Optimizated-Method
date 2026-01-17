@@ -1,4 +1,4 @@
-# Source Codes for Codimensional Incremental Potential Contact (C-IPC)
+
 
 ## Reference
 
