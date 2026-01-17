@@ -45,7 +45,14 @@ bool Compute_IncPotential(
     const std::vector<VECTOR<int, 3>>& stitchInfo,
     const std::vector<T>& stitchRatio,
     T k_stitch,
-    T& value)
+    T& value,
+
+    //ADDED:Rayleigh damping
+
+    MESH_NODE<T,dim>* XnPtr = nullptr,
+    T rayleighAlpha = (T)0,
+    T rayleighBeta = (T)0,
+    CSR_MATRIX<T>* K0Ptr = nullptr)
 {
     TIMER_FLAG("Compute_IncPotential");
     value = 0;
@@ -143,6 +150,31 @@ bool Compute_IncPotential(
         value += 0.5 * MXDiff.dot(xDiff);
     }
 
+    // >>> ADDED: Rayleigh damping energy (B-scheme)
+    if (!staticSolve && XnPtr && (rayleighAlpha != (T)0 || rayleighBeta != (T)0)) {
+        Eigen::VectorXd dx(X.size * dim);
+        X.Join(*XnPtr).Par_Each([&](int id, auto data) {
+            auto &[x, xn] = data;
+            dx[id * dim] = x[0] - xn[0];
+            dx[id * dim + 1] = x[1] - xn[1];
+            if constexpr (dim == 3) {
+                dx[id * dim + 2] = x[2] - xn[2];
+            }
+        });
+
+        if (rayleighAlpha != (T)0) {
+            Eigen::VectorXd Mdx = M.Get_Matrix() * dx;
+            value += (T)0.5 * (h * rayleighAlpha) * Mdx.dot(dx);
+        }
+        if (rayleighBeta != (T)0 && K0Ptr) {
+            Eigen::VectorXd Kdx = K0Ptr->Get_Matrix() * dx;
+            value += (T)0.5 * (rayleighBeta / h) * Kdx.dot(dx);
+        }
+    }
+    // <<< ADDED
+
+
+
     if (withCollision) {
         // IPC
         Compute_Barrier<T, dim, elasticIPC>(X, nodeAttr, constraintSet, stencilInfo, dHat2, kappa, thickness, value);
@@ -183,7 +215,14 @@ void Compute_IncPotential_Gradient(
     const std::vector<VECTOR<T, 3>>& rodHingeInfo,
     const std::vector<VECTOR<int, 3>>& stitchInfo,
     const std::vector<T>& stitchRatio,
-    T k_stitch)
+    T k_stitch,
+
+
+    // >>> ADDED: Rayleigh damping (B-scheme), see Compute_IncPotential for scaling
+    MESH_NODE<T, dim>* XnPtr = nullptr,
+    T rayleighAlpha = (T)0,
+    T rayleighBeta  = (T)0,
+    CSR_MATRIX<T>* K0Ptr = nullptr)
 {
     TIMER_FLAG("Compute_IncPotential_Gradient");
     nodeAttr.template Fill<FIELDS<MESH_NODE_ATTR<T, dim>>::g>(VECTOR<T, dim>(0));
@@ -268,6 +307,47 @@ void Compute_IncPotential_Gradient(
         });
     }
 
+
+
+    // >>> ADDED: Rayleigh damping gradient (B-scheme)
+    if (!staticSolve && XnPtr && (rayleighAlpha != (T)0 || rayleighBeta != (T)0)) {
+        Eigen::VectorXd dx(X.size * dim);
+        X.Join(*XnPtr).Par_Each([&](int id, auto data) {
+            auto &[x, xn] = data;
+            dx[id * dim] = x[0] - xn[0];
+            dx[id * dim + 1] = x[1] - xn[1];
+            if constexpr (dim == 3) {
+                dx[id * dim + 2] = x[2] - xn[2];
+            }
+        });
+
+        if (rayleighAlpha != (T)0) {
+            Eigen::VectorXd Mdx = M.Get_Matrix() * dx;
+            nodeAttr.Par_Each([&](int id, auto data){
+                auto &[x0, v, g, m] = data;
+                g[0] += (h * rayleighAlpha) * Mdx[id * dim];
+                g[1] += (h * rayleighAlpha) * Mdx[id * dim + 1];
+                if constexpr (dim == 3) {
+                    g[2] += (h * rayleighAlpha) * Mdx[id * dim + 2];
+                }
+            });
+        }
+        if (rayleighBeta != (T)0 && K0Ptr) {
+            Eigen::VectorXd Kdx = K0Ptr->Get_Matrix() * dx;
+            nodeAttr.Par_Each([&](int id, auto data){
+                auto &[x0, v, g, m] = data;
+                g[0] += (rayleighBeta / h) * Kdx[id * dim];
+                g[1] += (rayleighBeta / h) * Kdx[id * dim + 1];
+                if constexpr (dim == 3) {
+                    g[2] += (rayleighBeta / h) * Kdx[id * dim + 2];
+                }
+            });
+        }
+    }
+    // <<< ADDED
+
+
+
     if (withCollision) {
         // IPC
         Compute_Barrier_Gradient<T, dim, elasticIPC>(X, constraintSet, stencilInfo, dHat2, kappa, thickness, nodeAttr);
@@ -316,6 +396,12 @@ void Compute_IncPotential_Hessian(
     const std::vector<T>& stitchRatio,
     T k_stitch,
     bool projectSPD,
+
+    // >>> ADDED: Rayleigh damping 
+    T rayleighAlpha,
+    T rayleighBeta,
+    CSR_MATRIX<T>* K0Ptr,
+
     CSR_MATRIX<T>& sysMtr)
 {
     std::vector<Eigen::Triplet<T>> triplets;
@@ -384,6 +470,21 @@ void Compute_IncPotential_Hessian(
         TIMER_FLAG("add mass matrix");
         sysMtr.Get_Matrix() += M.Get_Matrix();
     }
+
+
+    // >>> ADDED: Rayleigh damping Hessian (B-scheme)
+    // Adds: h*rayleighAlpha*M  +  (rayleighBeta/h)*K0_inc
+    if (!staticSolve && (rayleighAlpha != (T)0 || rayleighBeta != (T)0)) {
+        if (rayleighAlpha != (T)0) {
+            sysMtr.Get_Matrix() += (h * rayleighAlpha) * M.Get_Matrix();
+        }
+        if (rayleighBeta != (T)0 && K0Ptr) {
+            sysMtr.Get_Matrix() += (rayleighBeta / h) * K0Ptr->Get_Matrix();
+        }
+    }
+    // <<< ADDED
+
+
     if (!DBCStiff) {
         // project Matrix for Dirichlet boundary condition
         sysMtr.Project_DBC(DBCb, dim);
